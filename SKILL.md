@@ -5,8 +5,8 @@ version: 0.1.0
 author: rui.duobao
 license: MIT-0
 description: |
-  DEM地形分析工具 - 从DEM数据生成坡度、坡向、山体阴影、等高线、曲率、流向、汇流等地形产品
   DEM Terrain Analysis - Generate slope, aspect, hillshade, contour, curvature, flow direction, accumulation from DEM data
+  DEM地形分析工具 - 从DEM数据生成坡度、坡向、山体阴影、等高线、曲率、流向、汇流等地形产品
 runtime: python>=3.9
 tags:
   - terrain
@@ -23,9 +23,68 @@ tags:
 
 # DEM Terrain Analysis
 
+Generate common terrain derivatives from DEM (Digital Elevation Model) data using pure Python.
+
+## Features
+
+- **Slope** — rate of elevation change (degrees or percent)
+- **Aspect** — compass direction of slope (degrees from north)
+- **Hillshade** — simulated illumination visualization
+- **Contour** — iso-line vectors at specified intervals (GeoJSON)
+- **Curvature** — plan and profile curvature
+- **Terrain Ruggedness Index (TRI)** — elevation difference with neighbors
+- **Topographic Position Index (TPI)** — relative neighborhood elevation
+- **Roughness** — max elevation difference in neighborhood
+- **Flow Direction (D8)** — steepest descent direction
+- **Flow Accumulation** — upstream contributing cells
+- **Watershed** — upstream catchment from outlet point
+- **Viewshed** — visible area from observer point
+
+## Usage
+
+```bash
+# Slope analysis
+python dem-terrain-analysis.py slope input_dem.tif --output slope.tif --unit degrees
+
+# Aspect analysis
+python dem-terrain-analysis.py aspect input_dem.tif --output aspect.tif
+
+# Hillshade
+python dem-terrain-analysis.py hillshade input_dem.tif --output hillshade.tif --azimuth 315 --altitude 45
+
+# Contour
+python dem-terrain-analysis.py contour input_dem.tif --output contour.geojson --interval 10
+
+# Curvature
+python dem-terrain-analysis.py curvature input_dem.tif --output curvature.tif --type plan
+
+# TRI / TPI / Roughness
+python dem-terrain-analysis.py tri input_dem.tif --output tri.tif
+python dem-terrain-analysis.py tpi input_dem.tif --output tpi.tif --window 3
+python dem-terrain-analysis.py roughness input_dem.tif --output roughness.tif
+
+# Hydrology analysis
+python dem-terrain-analysis.py flowdir input_dem.tif --output flowdir.tif
+python dem-terrain-analysis.py flowacc input_dem.tif --output flowacc.tif
+
+# Batch generate all products
+python dem-terrain-analysis.py batch input_dem.tif --output-dir ./terrain/
+```
+
+## Algorithm Notes
+
+- **3x3 window convolution**: slope, aspect, hillshade, curvature use Zevenbergen-Thorne algorithm
+- **D8 flow direction**: computes slope in 8 directions, picks steepest
+- **Marching Squares**: contour generation via marching squares algorithm
+- **Pure Python**: no external dependencies
+
+---
+
+## 中文说明
+
 从DEM（数字高程模型）数据派生常见地形产品的纯Python CLI工具。
 
-## 功能特性
+### 功能特性
 
 - **坡度 (Slope)** - 高程变化率，支持度数和百分比
 - **坡向 (Aspect)** - 坡面朝向（北向起算角度）
@@ -40,7 +99,7 @@ tags:
 - **流域划分 (Watershed)** - 给定出口点划定上游流域
 - **视域 (Viewshed)** - 给定观察点的可视区域
 
-## 使用方法
+### 使用方法
 
 ```bash
 # 坡度分析
@@ -71,7 +130,7 @@ python dem-terrain-analysis.py flowacc input_dem.tif --output flowacc.tif
 python dem-terrain-analysis.py batch input_dem.tif --output-dir ./terrain/
 ```
 
-## 算法说明
+### 算法说明
 
 - **3×3窗口卷积**: 坡度、坡向、山体阴影、曲率使用3×3窗口的Zevenbergen-Thorne算法
 - **D8流向**: 计算8个方向的坡度，选择最陡方向作为流向
