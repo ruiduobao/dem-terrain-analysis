@@ -1263,6 +1263,15 @@ def analyze_dem(input_path, analysis_type, output_path=None, **kwargs):
                       nodata=dem.nodata, pixel_scale=dem.pixel_scale,
                       tie_point=dem.tie_point)
 
+    elif analysis_type == 'watershed':
+        outlet_row = kwargs.get('outlet_row', dem.height // 2)
+        outlet_col = kwargs.get('outlet_col', dem.width // 2)
+        flow_dir = compute_flow_direction_grid(dem)
+        result = compute_watershed(flow_dir, outlet_row, outlet_col, dem.width, dem.height)
+        GeoTIFF.write(output_path, result, dem.width, dem.height,
+                      nodata=dem.nodata, pixel_scale=dem.pixel_scale,
+                      tie_point=dem.tie_point)
+
     elif analysis_type == 'viewshed':
         obs_row = kwargs.get('obs_row', dem.height // 2)
         obs_col = kwargs.get('obs_col', dem.width // 2)
@@ -1422,6 +1431,9 @@ def main():
             kwargs['type'] = args.type
         elif args.command == 'tpi':
             kwargs['window'] = args.window
+        elif args.command == 'watershed':
+            kwargs['outlet_row'] = args.outlet_row
+            kwargs['outlet_col'] = args.outlet_col
         elif args.command == 'viewshed':
             if args.obs_row is not None:
                 kwargs['obs_row'] = args.obs_row
