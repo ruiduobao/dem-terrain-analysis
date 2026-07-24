@@ -1,24 +1,11 @@
 ---
-name: dem-terrain-analysis
-display_name: DEM Terrain Analysis
-version: 0.1.0
-author: rui.duobao
-license: MIT-0
-description: |
-  DEM Terrain Analysis - Generate slope, aspect, hillshade, contour, curvature, flow direction, accumulation from DEM data
+description: 'DEM Terrain Analysis - Generate slope, aspect, hillshade, contour, curvature,
+  flow direction, accumulation from DEM data
+
   DEM地形分析工具 - 从DEM数据生成坡度、坡向、山体阴影、等高线、曲率、流向、汇流等地形产品
-runtime: python>=3.9
-tags:
-  - terrain
-  - dem
-  - gis
-  - slope
-  - aspect
-  - hillshade
-  - contour
-  - hydrology
-  - watershed
-  - viewshed
+
+  '
+name: dem-terrain-analysis
 ---
 
 # DEM Terrain Analysis

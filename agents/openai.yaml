@@ -1,0 +1,4 @@
+description: DEM Terrain Analysis - Generate slope, aspect, hillshade, contour, curvature,
+  flow direction, accumulation from DEM data
+display_name: Dem Terrain Analysis
+name: dem-terrain-analysis
