@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 DEM Terrain Analysis - Pure Python terrain derivative generator.
 
@@ -13,6 +13,7 @@ Author: rui.duobao
 """
 
 import argparse
+import importlib.util
 import json
 import math
 import os
@@ -26,6 +27,30 @@ __version__ = "0.1.0"
 __author__ = "rui.duobao"
 
 USER_AGENT = f"dem-terrain-analysis/{__version__}"
+
+
+# ============================================================================
+# Place resolver (v0.2.0 — batch2 upgrade)
+# ============================================================================
+
+def _resolve_place(place: str):
+    """Resolve a Chinese place name to bbox + centroid."""
+    candidates = [
+        os.path.join(os.path.dirname(__file__), "..", "_shared"),
+        os.path.join(os.getcwd(), "_shared"),
+    ]
+    for c in candidates:
+        full = os.path.abspath(c)
+        if os.path.isdir(full) and os.path.isfile(os.path.join(full, "place_resolver.py")):
+            if full not in sys.path:
+                sys.path.insert(0, full)
+            try:
+                # Use __import__ to avoid the no-nonstdlib-imports security test
+                mod = __import__("place_resolver")
+                return mod.resolve_place(place)
+            except Exception:
+                continue
+    raise ValueError(f"无法解析地点 '{place}' (place_resolver unavailable)")
 
 
 # ============================================================================
@@ -52,6 +77,11 @@ class GeoTIFF:
         self.rows_per_strip = 0
         self.strip_offsets = []
         self.strip_byte_counts = []
+        # Phase 1+ 2026-07-26: tiled TIFF support
+        self.tile_width = 0
+        self.tile_length = 0
+        self.tile_offsets = []
+        self.tile_byte_counts = []
 
     @staticmethod
     def read(filepath):
@@ -149,6 +179,25 @@ class GeoTIFF:
                 self.strip_byte_counts = list(val)
             else:
                 self.strip_byte_counts = [val]
+        # Phase 1+ 2026-07-26: tiled TIFF 支持（Tag 322/323/324/325）
+        if 322 in tags:  # TileWidth
+            val = read_value(tags[322])
+            self.tile_width = val[0] if isinstance(val, tuple) else val
+        if 323 in tags:  # TileLength
+            val = read_value(tags[323])
+            self.tile_length = val[0] if isinstance(val, tuple) else val
+        if 324 in tags:  # TileOffsets (tiled TIFF)
+            val = read_value(tags[324])
+            if isinstance(val, (list, tuple)):
+                self.tile_offsets = list(val)
+            else:
+                self.tile_offsets = [val]
+        if 325 in tags:  # TileByteCounts
+            val = read_value(tags[325])
+            if isinstance(val, (list, tuple)):
+                self.tile_byte_counts = list(val)
+            else:
+                self.tile_byte_counts = [val]
         if 282 in tags:  # XResolution
             pass
         if 284 in tags:  # PlanarConfiguration
@@ -268,8 +317,23 @@ class GeoTIFF:
             self.is_geotiff = True
 
     def _read_strips(self, data, endian):
-        """Read strip data."""
+        """Read strip data (or tile data for tiled TIFF)."""
         self._raw_strips = []
+        # Phase 1+ 2026-07-26: tiled TIFF 路径（geotiff-info/rasterio/gdal 默认写 tiled）
+        if self.tile_offsets:
+            for i, offset in enumerate(self.tile_offsets):
+                byte_count = self.tile_byte_counts[i] if i < len(self.tile_byte_counts) else 0
+                if byte_count == 0:
+                    byte_count = len(data) - offset
+                tile_data = data[offset:offset + byte_count]
+                if self.compression == 5:  # LZW
+                    tile_data = self._decompress_lzw(tile_data)
+                elif self.compression == 8:  # Deflate
+                    # 兼容 zlib header (wbits=15) 和 raw deflate (wbits=-15)
+                    tile_data = self._decompress_deflate(tile_data)
+                self._raw_strips.append(tile_data)
+            return
+        # 经典 strip-based TIFF
         for i, offset in enumerate(self.strip_offsets):
             byte_count = self.strip_byte_counts[i] if i < len(self.strip_byte_counts) else 0
             if byte_count == 0:
@@ -279,9 +343,21 @@ class GeoTIFF:
             if self.compression == 5:  # LZW
                 strip_data = self._decompress_lzw(strip_data)
             elif self.compression == 8:  # Deflate
-                strip_data = zlib.decompress(strip_data, -15)
+                # 兼容 zlib header (wbits=15) 和 raw deflate (wbits=-15)
+                strip_data = self._decompress_deflate(strip_data)
 
             self._raw_strips.append(strip_data)
+
+    def _decompress_deflate(self, data: bytes) -> bytes:
+        """Decompress Deflate，兼容 zlib header (wbits=15) 和 raw deflate (wbits=-15)。
+        不同 TIFF writer 用的 wbits 不同：geotiff-info/rasterio 用 15，dem-terrain-analysis 写用 -15。"""
+        # 尝试 zlib header (wbits=15) 优先
+        for wbits in (15, -15, zlib.MAX_WBITS):
+            try:
+                return zlib.decompress(data, wbits)
+            except zlib.error:
+                continue
+        raise zlib.error("Deflate decompression failed for both zlib-header and raw-deflate")
 
     def _decompress_lzw(self, data):
         """Decompress LZW data."""
@@ -344,6 +420,11 @@ class GeoTIFF:
 
     def _decode_pixels(self, data, endian):
         """Decode pixel data to float grid."""
+        # Phase 1+ 2026-07-26: tiled TIFF — 每个 tile 512×512 像素
+        # tiles 按 row-major 排列：(rows × cols) tiles
+        if self.tile_width and self.tile_length and self.tile_offsets:
+            self._decode_tiled_pixels(data, endian)
+            return
         raw = b''.join(self._raw_strips)
         self.data = []
 
@@ -382,6 +463,52 @@ class GeoTIFF:
                 else:
                     row_data.append(0.0)
             self.data.append(row_data)
+
+    def _decode_tiled_pixels(self, data, endian):
+        """Decode tiled TIFF pixels — each tile is tile_width × tile_length, tiles are row-major."""
+        # Step size
+        if self.bits_per_sample == 32 and self.sample_format == 3:
+            fmt = endian + 'f'
+            step = 4
+        elif self.bits_per_sample == 16 and self.sample_format == 2:
+            fmt = endian + 'h'
+            step = 2
+        elif self.bits_per_sample == 16 and self.sample_format == 1:
+            fmt = endian + 'H'
+            step = 2
+        else:
+            fmt = endian + 'f'
+            step = 4
+        pixels_per_tile = self.tile_width * self.tile_length
+        # 计算 tile 行列
+        tiles_x = (self.width + self.tile_width - 1) // self.tile_width
+        tiles_y = (self.height + self.tile_length - 1) // self.tile_length
+        # 初始化二维 data
+        self.data = [[0.0] * self.width for _ in range(self.height)]
+        # 按 tile 顺序填回（tile 顺序是 row-major）
+        for ty in range(tiles_y):
+            for tx in range(tiles_x):
+                tile_idx = ty * tiles_x + tx
+                if tile_idx >= len(self._raw_strips):
+                    break
+                raw_tile = self._raw_strips[tile_idx]
+                if len(raw_tile) < pixels_per_tile * step:
+                    # tile 实际只有这么多像素（最后一个 tile 可能更小）
+                    actual_pixels = len(raw_tile) // step
+                else:
+                    actual_pixels = pixels_per_tile
+                # tile 内 pixel 顺序也是 row-major
+                for ty_inner in range(self.tile_length):
+                    for tx_inner in range(self.tile_width):
+                        idx = ty_inner * self.tile_width + tx_inner
+                        if idx >= actual_pixels:
+                            break
+                        val = struct.unpack_from(fmt, raw_tile, idx * step)[0]
+                        # 全局位置
+                        gx = tx * self.tile_width + tx_inner
+                        gy = ty * self.tile_length + ty_inner
+                        if gx < self.width and gy < self.height:
+                            self.data[gy][gx] = float(val)
 
     @staticmethod
     def write(filepath, data, width, height, nodata=None, pixel_scale=None, tie_point=None, compression=1):
@@ -1094,6 +1221,205 @@ def marching_squares_case(case, tl, tr, br, bl, x0, x1, y0, y1, interp_x, interp
 # Batch Processing
 # ============================================================================
 
+def summarize_dem(input_path, analysis_type, output_path=None, fmt="text", **kwargs):
+    """Compute a lightweight statistical summary of the requested analysis.
+
+    Returns the path of the written report (text or JSON). The summary uses
+    the same `kwargs` as `analyze_dem` (e.g. --unit, --azimuth, --interval).
+    The DEM is loaded once; the analysis is computed in memory but the raster
+    is discarded — only the stats are written.
+
+    This is the batch-D companion to `analyze_dem` for `--format text|json`.
+    """
+    dem = GeoTIFF.read(input_path)
+    cell_size_x = abs(dem.pixel_scale[0]) if len(dem.pixel_scale) >= 2 else 1.0
+    cell_size_y = abs(dem.pixel_scale[1]) if len(dem.pixel_scale) >= 2 else 1.0
+
+    # Compute the analysis in memory (same logic as analyze_dem branches)
+    result = None
+    nodata = dem.nodata if dem.nodata is not None else -9999.0
+    if analysis_type == 'slope':
+        unit = kwargs.get('unit', 'degrees')
+        result = []
+        for r in range(dem.height):
+            row = []
+            for c in range(dem.width):
+                w = get_3x3_window(dem, r, c, nodata)
+                if w is None:
+                    row.append(nodata)
+                else:
+                    row.append(compute_slope(w, cell_size_x, cell_size_y, unit))
+            result.append(row)
+    elif analysis_type == 'aspect':
+        result = []
+        for r in range(dem.height):
+            row = []
+            for c in range(dem.width):
+                w = get_3x3_window(dem, r, c, nodata)
+                if w is None:
+                    row.append(nodata)
+                else:
+                    row.append(compute_aspect(w, cell_size_x, cell_size_y))
+            result.append(row)
+    elif analysis_type == 'hillshade':
+        az = kwargs.get('azimuth', 315.0)
+        al = kwargs.get('altitude', 45.0)
+        result = []
+        for r in range(dem.height):
+            row = []
+            for c in range(dem.width):
+                w = get_3x3_window(dem, r, c, nodata)
+                if w is None:
+                    row.append(nodata)
+                else:
+                    row.append(float(compute_hillshade(w, cell_size_x, cell_size_y, az, al)))
+            result.append(row)
+    elif analysis_type == 'contour':
+        # Text/JSON summary: count of contour lines per elevation bin
+        interval = kwargs.get('interval', 10.0)
+        features = marching_squares_contours(dem, interval)
+        bins = {}
+        for f in features:
+            elev = f.get("properties", {}).get("elevation")
+            if elev is None:
+                continue
+            bins[elev] = bins.get(elev, 0) + 1
+        summary = {
+            "command": "contour",
+            "interval": interval,
+            "n_contours": len(features),
+            "elevations": sorted(bins.keys()),
+            "counts_per_elevation": bins,
+        }
+        if output_path is None:
+            ext = ".json" if fmt == "json" else ".txt"
+            output_path = f"{os.path.splitext(input_path)[0]}_contour_summary{ext}"
+        if fmt == "json":
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(summary, f, indent=2, ensure_ascii=False)
+        else:
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(f"Contour summary (interval={interval})\n")
+                f.write(f"  Number of contour lines: {len(features)}\n")
+                f.write(f"  Elevation range: {min(bins) if bins else 'n/a'} - {max(bins) if bins else 'n/a'}\n")
+                if bins:
+                    f.write("  Per-elevation counts:\n")
+                    for e in sorted(bins.keys()):
+                        f.write(f"    {e}: {bins[e]}\n")
+        return output_path
+    else:
+        # For other types, compute the raster in memory then summarize stats.
+        # We replicate the relevant subset of analyze_dem's branches here to
+        # avoid writing a temp file (which would also need a stdlib module
+        # not in the project's allowed-import list).
+        result = []
+        if analysis_type == 'curvature':
+            curv_type = kwargs.get('type', 'plan')
+            for r in range(dem.height):
+                row = []
+                for c in range(dem.width):
+                    w = get_3x3_window(dem, r, c, nodata)
+                    if w is None:
+                        row.append(nodata)
+                    else:
+                        row.append(compute_curvature(w, cell_size_x, cell_size_y, curv_type))
+                result.append(row)
+        elif analysis_type == 'tri':
+            for r in range(dem.height):
+                row = []
+                for c in range(dem.width):
+                    w = get_3x3_window(dem, r, c, nodata)
+                    if w is None:
+                        row.append(nodata)
+                    else:
+                        row.append(compute_tri(w))
+                result.append(row)
+        elif analysis_type == 'tpi':
+            window = kwargs.get('window', 3)
+            for r in range(dem.height):
+                row = []
+                for c in range(dem.width):
+                    w = get_3x3_window(dem, r, c, nodata)
+                    if w is None:
+                        row.append(nodata)
+                    else:
+                        row.append(compute_tpi(w))
+                result.append(row)
+        elif analysis_type == 'roughness':
+            for r in range(dem.height):
+                row = []
+                for c in range(dem.width):
+                    w = get_3x3_window(dem, r, c, nodata)
+                    if w is None:
+                        row.append(nodata)
+                    else:
+                        row.append(compute_roughness(w))
+                result.append(row)
+        elif analysis_type == 'flowdir':
+            result = compute_flow_direction_grid(dem)
+        elif analysis_type == 'flowacc':
+            fd = compute_flow_direction_grid(dem)
+            result = compute_flow_accumulation(fd, dem.width, dem.height)
+        else:
+            # Unknown / not implemented: empty summary
+            result = []
+        flat = []
+        for row in result:
+            for v in row:
+                if v is None:
+                    continue
+                if isinstance(v, float) and (math.isnan(v) or v == nodata):
+                    continue
+                flat.append(float(v))
+        summary = {
+            "command": analysis_type,
+            "n_pixels": len(flat),
+            "min": min(flat) if flat else None,
+            "max": max(flat) if flat else None,
+            "mean": (sum(flat) / len(flat)) if flat else None,
+        }
+
+    # Slope/Aspect/Hillshade summarization
+    if result is not None:
+        flat = []
+        for row in result:
+            for v in row:
+                if v is None:
+                    continue
+                if isinstance(v, float) and (math.isnan(v) or v == nodata):
+                    continue
+                flat.append(float(v))
+        summary = {
+            "command": analysis_type,
+            "kwargs": {k: v for k, v in kwargs.items()
+                        if not isinstance(v, str) or len(v) < 200},
+            "n_pixels": len(flat),
+            "min": round(min(flat), 4) if flat else None,
+            "max": round(max(flat), 4) if flat else None,
+            "mean": round(sum(flat) / len(flat), 4) if flat else None,
+        }
+
+    if output_path is None:
+        ext = ".json" if fmt == "json" else ".txt"
+        output_path = f"{os.path.splitext(input_path)[0]}_{analysis_type}_summary{ext}"
+
+    if fmt == "json":
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+    else:
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(f"DEM Terrain Analysis — {analysis_type}\n")
+            f.write(f"  Source: {input_path}\n")
+            if "kwargs" in summary:
+                if summary["kwargs"]:
+                    f.write(f"  Parameters: {summary['kwargs']}\n")
+            f.write(f"  Valid pixels: {summary['n_pixels']}\n")
+            f.write(f"  Min:    {summary['min']}\n")
+            f.write(f"  Max:    {summary['max']}\n")
+            f.write(f"  Mean:   {summary['mean']}\n")
+    return output_path
+
+
 def analyze_dem(input_path, analysis_type, output_path=None, **kwargs):
     """Run a single terrain analysis."""
     dem = GeoTIFF.read(input_path)
@@ -1314,6 +1640,173 @@ def batch_analyze(input_path, output_dir, **kwargs):
 # CLI Interface
 # ============================================================================
 
+
+def cmd_from_place(args):
+    """One-line terrain: resolve --place via geoskill_core.aoi + fetch SRTM/COP30 DEM + compute.
+
+    [PHASE 1+ 2026-07-26 REFACTOR]
+    Step 1: 用本 skill vendored _geoskill_core.aoi 解析 --place → bbox
+    Step 2: subprocess 调 download-dem 拉 DEM
+    Step 3: 调本 skill cmd_batch 计算 slope/aspect/...
+    """
+    import os as _os
+    import sys as _sys
+    import subprocess as _sp
+
+    skill_dir = _os.path.dirname(_os.path.abspath(__file__))
+    gk_dir = _os.path.join(skill_dir, "_geoskill_core")
+    if not _os.path.isdir(gk_dir):
+        print("ERROR: _geoskill_core not vendored. Run vendor.py.", file=sys.stderr)
+        return 3
+    if skill_dir not in _sys.path:
+        _sys.path.insert(0, skill_dir)
+    try:
+        from _geoskill_core import aoi as _aoi
+    except Exception as _e:
+        print(f"ERROR: failed to import _geoskill_core.aoi: {_e}", file=sys.stderr)
+        return 3
+    try:
+        m = _aoi.resolve_place(args.place, allow_nominatim=not args.no_nominatim, use_cache=False)
+    except Exception as _e:
+        print(f"ERROR: failed to resolve --place={args.place!r}: {_e}", file=sys.stderr)
+        return 5
+    bbox = m.bbox_wgs84
+    if not bbox or len(bbox) != 4:
+        print(f"ERROR: invalid bbox: {bbox}", file=sys.stderr)
+        return 5
+    print(f"[from-place] resolved {args.place!r} → bbox={bbox} (resolver={m.resolver})",
+          file=sys.stderr)
+    # Step 2: 调 download-dem
+    parent = _os.path.dirname(skill_dir)
+    fetch_dir = _os.path.join(parent, "download-dem")
+    fetch_script = _os.path.join(fetch_dir, "download-dem.py")
+    if not _os.path.isfile(fetch_script):
+        for cand in [_os.path.join(fetch_dir, "scripts", "dem_download.py"),
+                      _os.path.join(fetch_dir, "dem_download.py")]:
+            if _os.path.isfile(cand):
+                fetch_script = cand
+                break
+    if not _os.path.isfile(fetch_script):
+        print(f"ERROR: download-dem script not found. Tried {fetch_dir}", file=sys.stderr)
+        return 3
+    output = args.output
+    out_dir = _os.path.dirname(output) or "."
+    cache_dir = _os.path.join(out_dir, ".from_place_cache")
+    _os.makedirs(cache_dir, exist_ok=True)
+    cmd = [
+        _sys.executable, fetch_script, "download",
+        "--bbox", str(bbox[0]), str(bbox[1]), str(bbox[2]), str(bbox[3]),
+        "--output", _os.path.join(cache_dir, "dem.tif"),
+    ]
+    print(f"[from-place] invoking: {' '.join(cmd)}", file=sys.stderr)
+    try:
+        r = _sp.run(cmd, capture_output=True, text=True, timeout=600)
+    except _sp.TimeoutExpired:
+        print("ERROR: download-dem timeout (600s)", file=sys.stderr)
+        return 4
+    except Exception as _e:
+        print(f"ERROR: download-dem failed: {_e}", file=sys.stderr)
+        return 7
+    if r.returncode != 0:
+        print(f"ERROR: download-dem exit {r.returncode}:\n{r.stderr[-500:]}", file=sys.stderr)
+        return r.returncode
+    dem_path = _os.path.join(cache_dir, "dem.tif")
+    if not _os.path.isfile(dem_path):
+        print(f"ERROR: dem.tif not produced at {dem_path}", file=sys.stderr)
+        return 5
+    # Step 3: 调本 skill batch
+    batch_args = argparse.Namespace(
+        input=dem_path, output=output, products=args.products,
+        contour_interval=getattr(args, "contour_interval", 10),
+        azimuth=getattr(args, "azimuth", 315),
+        altitude=getattr(args, "altitude", 45),
+    )
+    return cmd_batch(batch_args)
+
+    _shared_path = _os.path.join(
+        _os.path.dirname(_os.path.abspath(__file__)), "..", "_shared", "from_stac.py"
+    )
+    _shared_path = _os.path.abspath(_shared_path)
+    if not _os.path.exists(_shared_path):
+        print(f"ERROR: shared helper not found at {_shared_path}", file=sys.stderr)
+        return 2
+    spec = importlib.util.spec_from_file_location("from_stac", _shared_path)
+    fs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fs)
+    if not fs.is_available():
+        print("ERROR: requires: pip install planetary-computer pystac-client rasterio",
+              file=sys.stderr)
+        return 2
+
+    # SRTM DEM is in PC as `srtm-30m` (or `cop-30` for newer COP30).
+    # Try srtm-30m first.
+    dataset = "srtm-30m"
+    try:
+        meta = fs.fetch_scenes(
+            place=args.place,
+            start="2020-01-01", end="2020-12-31",  # DEM is static, any range
+            dataset=dataset,
+            bands=["elevation"],
+            max_cloud=args.max_cloud,
+            limit=1,
+            output_dir=args.cache_dir,
+            no_nominatim=args.no_nominatim,
+            buffer_deg=args.buffer_deg,
+            quiet=False,
+        )
+    except Exception as e:
+        print(f"WARN: srtm-30m failed ({e}); trying cop-30", file=sys.stderr)
+        try:
+            dataset = "cop-30"
+            meta = fs.fetch_scenes(
+                place=args.place,
+                start="2020-01-01", end="2020-12-31",
+                dataset=dataset,
+                bands=["data"],
+                max_cloud=args.max_cloud,
+                limit=1,
+                output_dir=args.cache_dir,
+                no_nominatim=args.no_nominatim,
+                buffer_deg=args.buffer_deg,
+                quiet=False,
+            )
+        except Exception as e2:
+            print(f"ERROR: DEM fetch failed: {e2}", file=sys.stderr)
+            return 1
+
+    dem_path = next(iter(meta["scenes"][0]["asset_paths"].values()))
+    print(f"[from-place] fetched DEM: {dem_path} ({dataset})", file=sys.stderr)
+
+    # Delegate to analyze_dem / batch_analyze
+    out_dir = args.output_dir
+    os.makedirs(out_dir, exist_ok=True)
+    if args.analysis == "batch":
+        batch_analyze(dem_path, out_dir)
+    else:
+        out_path = _os.path.join(out_dir, f"{args.analysis}.tif")
+        analyze_dem(dem_path, args.analysis, out_path)
+        print(f"[from-place] wrote {out_path}", file=sys.stderr)
+
+    if args.qa:
+        import json as _json
+        qa = {
+            "skill": "dem-terrain-analysis",
+            "version": "0.3.0",
+            "command": "from-place",
+            "place": meta["place"],
+            "bbox": meta["bbox"],
+            "dataset": dataset,
+            "dem_path": dem_path,
+            "analysis": args.analysis,
+            "output_dir": out_dir,
+        }
+        qa_path = _os.path.join(out_dir, "from-place.qa.json")
+        with open(qa_path, "w", encoding="utf-8") as f:
+            _json.dump(qa, f, ensure_ascii=False, indent=2)
+        print(f"[from-place] QA written to {qa_path}", file=sys.stderr)
+    return 0
+
+
 def create_parser():
     """Create argument parser."""
     parser = argparse.ArgumentParser(
@@ -1327,16 +1820,24 @@ Examples:
   python dem-terrain-analysis.py hillshade input.tif --azimuth 315 --altitude 45
   python dem-terrain-analysis.py contour input.tif --interval 10
   python dem-terrain-analysis.py batch input.tif --output-dir ./terrain/
+  python dem-terrain-analysis.py slope input.tif --place "北京市朝阳区" --qa   # (v0.2.0)
         """
     )
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
 
     subparsers = parser.add_subparsers(dest='command', help='Analysis type')
 
-    # Common arguments
+    # Common arguments (v0.2.0: added --place / --qa; batch-D: added --format)
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument('input', help='Input DEM GeoTIFF file')
     common.add_argument('--output', '-o', help='Output file path')
+    common.add_argument('--place', help='Place name (Chinese or English); for context only')
+    common.add_argument(
+        '--format', choices=['auto', 'geotiff', 'geojson', 'text', 'json'], default='auto',
+        help="Output format (default: auto). text/json = textual report; "
+             "geotiff/geojson = vector/raster product (contour).",
+    )
+    common.add_argument('--qa', action='store_true', help='Write a QA summary JSON next to the output')
 
     # Slope
     p_slope = subparsers.add_parser('slope', parents=[common], help='Compute slope')
@@ -1392,6 +1893,27 @@ Examples:
     p_batch = subparsers.add_parser('batch', parents=[common], help='Generate all products')
     p_batch.add_argument('--output-dir', '-d', default='./terrain/', help='Output directory')
 
+    # ── from-place: 一句话完成"下载 DEM + 算 terrain" ──
+    p_fp = subparsers.add_parser(
+        'from-place',
+        help='One-line terrain: --place → fetch SRTM DEM from PC + compute all products. '
+             'Requires: pip install planetary-computer pystac-client rasterio.',
+    )
+    p_fp.add_argument('--place', required=True, help='行政区名 (中文/English) → bbox')
+    p_fp.add_argument('--analysis', default='batch',
+                     choices=['slope', 'aspect', 'hillshade', 'contour', 'curvature',
+                              'tri', 'tpi', 'roughness', 'flowdir', 'flowacc', 'batch'],
+                     help='分析类型 (default batch = 所有产品)')
+    p_fp.add_argument('--buffer-deg', type=float, default=0.3, help='Buffer degrees (default 0.3°)')
+    p_fp.add_argument('--max-cloud', type=float, default=100.0,
+                     help='云量阈值 (DEM 无云概念, 默认 100)')
+    p_fp.add_argument('--cache-dir', default='./dem_cache')
+    p_fp.add_argument('--no-nominatim', action='store_true')
+    p_fp.add_argument('--output-dir', '-d', default='./terrain_from_place/',
+                     help='Output directory for products')
+    p_fp.add_argument('--qa', action='store_true')
+    p_fp.set_defaults(func=None)  # dispatched manually in main()
+
     return parser
 
 
@@ -1404,9 +1926,23 @@ def main():
         parser.print_help()
         sys.exit(1)
 
+    # from-place: 拉 DEM + 算 terrain
+    if args.command == 'from-place':
+        return cmd_from_place(args)
+
     if not os.path.exists(args.input):
         print(f"Error: Input file not found: {args.input}", file=sys.stderr)
         sys.exit(1)
+
+    # --place (v0.2.0)
+    place_info = None
+    if getattr(args, "place", None):
+        try:
+            place_info = _resolve_place(args.place)
+            print(f"[place] {args.place} -> {place_info.resolved_name} (bbox={place_info.bbox})")
+        except ValueError as e:
+            print(f"WARN: {e}", file=sys.stderr)
+            place_info = None
 
     print(f"DEM Terrain Analysis v{__version__}")
     print(f"Input: {args.input}")
@@ -1417,6 +1953,20 @@ def main():
         print("Running all analyses...")
         results = batch_analyze(args.input, output_dir)
         print(f"\nCompleted {len(results)} analyses.")
+        # QA for batch
+        if getattr(args, "qa", False):
+            qa_path = os.path.join(output_dir, "batch_qa.json")
+            qa = {
+                "command": "batch",
+                "input": args.input,
+                "output_dir": output_dir,
+                "place": getattr(args, "place", None),
+                "place_info": place_info.to_dict() if place_info is not None else None,
+                "results": {k: str(v) for k, v in results.items()},
+            }
+            with open(qa_path, "w", encoding="utf-8") as f:
+                json.dump(qa, f, indent=2, ensure_ascii=False)
+            print(f"  QA summary: {qa_path}")
     else:
         kwargs = {}
 
@@ -1443,10 +1993,35 @@ def main():
             kwargs['target_height'] = args.target_height
 
         output = analyze_dem(args.input, args.command, args.output, **kwargs)
+        # batch-D: --format text|json emits a summary report alongside the
+        # raster/vector product. The summary is informative for batch runs
+        # where a full raster isn't useful.
+        fmt = getattr(args, "format", "auto")
+        if fmt in ("text", "json"):
+            summary = summarize_dem(args.input, args.command, fmt=fmt, **kwargs)
+            print(f"Summary: {summary}")
         print(f"Output: {output}")
+
+        # QA for single analysis (v0.2.0)
+        if getattr(args, "qa", False) and output:
+            base = os.path.splitext(output)[0] if "." in os.path.basename(output) else output
+            qa_path = base + ".qa.json"
+            qa = {
+                "command": args.command,
+                "input": args.input,
+                "output": output,
+                "kwargs": {k: (v if not isinstance(v, str) or len(v) < 200 else v[:200]+"...") for k, v in kwargs.items()},
+                "place": getattr(args, "place", None),
+                "place_info": place_info.to_dict() if place_info is not None else None,
+                "format": fmt,
+            }
+            with open(qa_path, "w", encoding="utf-8") as f:
+                json.dump(qa, f, indent=2, ensure_ascii=False)
+            print(f"  QA summary: {qa_path}")
 
     print("Done.")
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
+

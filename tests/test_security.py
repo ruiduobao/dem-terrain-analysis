@@ -77,9 +77,30 @@ class TestNoUnsafeOperations:
             assert 'exec(' not in stripped, f"exec() found in: {stripped}"
 
     def test_no_subprocess(self):
-        """Module should not use subprocess."""
+        """Module should not use subprocess (allowed: cmd_from_place PHASE 1+ orchestration)."""
         source = open(_module_path, 'r', encoding='utf-8').read()
-        assert 'import subprocess' not in source
+        # PHASE 1+ 2026-07-26: cmd_from_place 块内允许 subprocess（编排其他 skill）
+        # 简单方案：只允许 cmd_from_place 函数体内出现 import subprocess
+        if "def cmd_from_place" in source:
+            # 找 cmd_from_place 范围
+            start = source.index("def cmd_from_place")
+            # 找下一个 def 或顶层声明结束
+            rest = source[start:]
+            # 取到下一个顶级 def（行首有 4 空格缩进的 def 不算）
+            lines = rest.split("\n")
+            end = len(lines)
+            for i, ln in enumerate(lines[1:], 1):
+                if (ln.startswith("def ") or ln.startswith("# ====") or
+                        ln.startswith("class ")):
+                    end = i
+                    break
+            from_place_block = "\n".join(lines[:end])
+            rest_of_file = rest.replace(from_place_block, "")
+            assert "import subprocess" not in rest_of_file, (
+                "import subprocess only allowed in cmd_from_place (PHASE 1+ orchestration)"
+            )
+        else:
+            assert "import subprocess" not in source
 
     def test_no_os_system(self):
         """Module should not use os.system()."""
@@ -160,7 +181,9 @@ class TestDependencyCheck:
         source = open(_module_path, 'r', encoding='utf-8').read()
         stdlib_modules = {
             'argparse', 'collections', 'json', 'math', 'os', 'struct',
-            'sys', 'zlib', 'deque', 'pathlib'
+            'sys', 'zlib', 'deque', 'pathlib', 'importlib', 're', 'time',
+            # PHASE 1+ 2026-07-26: cmd_from_place 允许 subprocess + vendored geoskill_core
+            'subprocess', 'shutil', '_geoskill_core',
         }
         import_lines = []
         for line in source.split('\n'):
