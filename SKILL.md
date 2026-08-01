@@ -1,6 +1,6 @@
 ---
 name: dem-terrain-analysis
-description: 'DEM Terrain Analysis - Generate slope, aspect, hillshade, contour, curvature, description: 'DEM Terrain Analysis - Generate slope, aspect, hillshade, contour, curvature, flow direction, accumulation from DEM data  DEM地形分析工具 - 从DEM数据生成坡度、坡向、山体阴影、等高线、曲率、流向、汇流等地形产品  '
+description: 'DEM Terrain Analysis - Generate slope, aspect, hillshade, contour, curvature, flow direction, accumulation from DEM data  DEM地形分析工具 - 从DEM数据生成坡度、坡向、山体阴影、等高线、曲率、流向、汇流等地形产品  '
 ---
 
 # DEM Terrain Analysis
